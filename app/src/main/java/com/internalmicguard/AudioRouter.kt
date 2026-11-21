@@ -16,9 +16,11 @@ class AudioRouter(context: Context) {
         const val ROLE_INPUT = 1
         const val DEVICE_ROLE_PREFERRED = 1
         const val DEVICE_ROLE_DISABLED = 2
-        private const val SET = "setDevicesRoleForCapturePreset"
-        private const val CLEAR = "clearDevicesRoleForCapturePreset"
+        private const val SET_PREFERRED = "setPreferredDevicesForCapturePreset"
+        private const val CLEAR_PREFERRED = "clearPreferredDevicesForCapturePreset"
+        private const val GET_PREFERRED = "getPreferredDevicesForCapturePreset"
         private const val SHELL_PACKAGE = "com.android.shell"
+        private val SIGNATURE_KEYWORDS = listOf("capturepreset", "preferreddevice", "devicesrole")
 
         val PRESETS = linkedMapOf(
             MediaRecorder.AudioSource.MIC to "MIC",
@@ -77,10 +79,11 @@ class AudioRouter(context: Context) {
     fun inspect(): List<String> {
         val svc = audioService()
         signatures = svc.javaClass.methods
-            .filter { it.name == SET || it.name == CLEAR }
+            .filter { m -> SIGNATURE_KEYWORDS.any { m.name.lowercase().contains(it) } }
             .map { signature(it) }
             .distinct()
-            .ifEmpty { listOf("nenhuma assinatura $SET/$CLEAR encontrada em ${svc.javaClass.name}") }
+            .sorted()
+            .ifEmpty { listOf("nenhum método CapturePreset/PreferredDevice/DevicesRole em ${svc.javaClass.name}") }
         return signatures
     }
 
@@ -108,28 +111,52 @@ class AudioRouter(context: Context) {
         return if (next == ints.size) args else null
     }
 
-    private fun call(svc: Any, name: String, ints: IntArray, devices: List<Any>?): String {
-        val candidates = svc.javaClass.methods.filter { it.name == name }
-        if (candidates.isEmpty()) throw NoSuchMethodException("$name ausente em ${svc.javaClass.name}")
+    private fun formatResult(result: Any?): String = when (result) {
+        null -> "void"
+        0 -> "SUCCESS(0)"
+        is Int -> "status=$result"
+        is Boolean -> "result=$result"
+        is List<*> -> if (result.isEmpty()) "[]" else result.joinToString(prefix = "[", postfix = "]")
+        else -> result.toString()
+    }
+
+    private fun invokeMethods(
+        svc: Any,
+        methods: List<Method>,
+        intVariants: List<IntArray>,
+        devices: List<Any>?
+    ): String? {
         var lastError: Throwable? = null
-        for (m in candidates) {
-            val args = buildArgs(m, ints, devices) ?: continue
-            try {
-                val result = m.invoke(svc, *args)
-                val status = when (result) {
-                    null -> "void"
-                    0 -> "SUCCESS(0)"
-                    else -> "status=$result"
+        for (m in methods) {
+            for (ints in intVariants) {
+                val args = buildArgs(m, ints, devices) ?: continue
+                try {
+                    return "${formatResult(m.invoke(svc, *args))} via ${signature(m)}"
+                } catch (e: InvocationTargetException) {
+                    lastError = e.targetException ?: e
+                } catch (e: Throwable) {
+                    lastError = e
                 }
-                return "$status via ${signature(m)}"
-            } catch (e: InvocationTargetException) {
-                lastError = e.targetException ?: e
-            } catch (e: Throwable) {
-                lastError = e
             }
         }
-        throw lastError ?: NoSuchMethodException("nenhuma assinatura compatível para $name")
+        if (lastError != null) throw lastError
+        return null
     }
+
+    private fun call(svc: Any, name: String, ints: IntArray, devices: List<Any>?): String {
+        val candidates = svc.javaClass.methods.filter { it.name == name }
+        if (candidates.isEmpty()) return "INFO: $name ausente em ${svc.javaClass.simpleName}"
+        return invokeMethods(svc, candidates, listOf(ints), devices)
+            ?: "INFO: nenhuma assinatura compatível para $name"
+    }
+
+    private fun disabledMethods(svc: Any, prefixes: List<String>): List<Method> =
+        svc.javaClass.methods.filter { m ->
+            val n = m.name.lowercase()
+            n.contains("capturepreset") &&
+                (n.contains("disabled") || n.contains("nondefault")) &&
+                prefixes.any { n.startsWith(it) }
+        }
 
     private fun step(label: String, block: () -> String): String =
         try {
@@ -138,6 +165,21 @@ class AudioRouter(context: Context) {
             val cause = if (e is InvocationTargetException) e.targetException ?: e else e
             "[$label] ERRO ${cause.javaClass.simpleName}: ${cause.message}"
         }
+
+    private fun clearDisabled(svc: Any, preset: Int, headsetAttr: Any?): String {
+        val methods = disabledMethods(svc, listOf("clear", "remove"))
+        if (methods.isEmpty()) return "INFO: sem método Disabled/NonDefault de limpeza no IAudioService"
+        val devices = headsetAttr?.let { listOf(it) }
+        return invokeMethods(svc, methods, listOf(intArrayOf(preset), intArrayOf(preset, DEVICE_ROLE_DISABLED)), devices)
+            ?: "INFO: métodos ${methods.joinToString { it.name }} exigem argumentos indisponíveis"
+    }
+
+    private fun setDisabled(svc: Any, preset: Int, headsetAttr: Any): String {
+        val methods = disabledMethods(svc, listOf("set", "add"))
+        if (methods.isEmpty()) return "INFO: IAudioService sem método Disabled/NonDefault para CapturePreset; bloqueio do P2 ignorado"
+        return invokeMethods(svc, methods, listOf(intArrayOf(preset), intArrayOf(preset, DEVICE_ROLE_DISABLED)), listOf(headsetAttr))
+            ?: "INFO: nenhuma assinatura compatível em ${methods.joinToString { it.name }}"
+    }
 
     fun enable(mic: AudioDeviceInfo, headset: AudioDeviceInfo?, blockHeadset: Boolean): List<String> {
         val out = mutableListOf<String>()
@@ -161,23 +203,26 @@ class AudioRouter(context: Context) {
         } else null
 
         out += "ATIVAR mic=${describe(mic)}"
-        if (blockHeadset) out += "BLOQUEAR P2=${headset?.let { describe(it) } ?: "nenhum headset conectado"}"
+        if (blockHeadset) {
+            out += "BLOQUEAR P2=${headset?.let { describe(it) } ?: "nenhum headset conectado"}"
+            if (disabledMethods(svc, listOf("set", "add")).isEmpty()) {
+                out += "INFO: IAudioService não expõe role DISABLED/NonDefault para CapturePreset; apenas PREFERRED será aplicado"
+            }
+        }
 
         for ((preset, name) in PRESETS) {
             try {
-                out += step("$name($preset) clear PREFERRED") {
-                    call(svc, CLEAR, intArrayOf(preset, DEVICE_ROLE_PREFERRED), null)
+                out += step("$name($preset) clearPreferred") {
+                    call(svc, CLEAR_PREFERRED, intArrayOf(preset), null)
                 }
-                out += step("$name($preset) clear DISABLED") {
-                    call(svc, CLEAR, intArrayOf(preset, DEVICE_ROLE_DISABLED), null)
+                out += step("$name($preset) setPreferred") {
+                    call(svc, SET_PREFERRED, intArrayOf(preset), listOf(micAttr))
                 }
-                out += step("$name($preset) set PREFERRED") {
-                    call(svc, SET, intArrayOf(preset, DEVICE_ROLE_PREFERRED), listOf(micAttr))
+                if (headsetAttr != null && disabledMethods(svc, listOf("set", "add")).isNotEmpty()) {
+                    out += step("$name($preset) setDisabled") { setDisabled(svc, preset, headsetAttr) }
                 }
-                if (headsetAttr != null) {
-                    out += step("$name($preset) set DISABLED") {
-                        call(svc, SET, intArrayOf(preset, DEVICE_ROLE_DISABLED), listOf(headsetAttr))
-                    }
+                out += step("$name($preset) getPreferred") {
+                    call(svc, GET_PREFERRED, intArrayOf(preset), null)
                 }
             } catch (e: Throwable) {
                 out += "[$name($preset)] ERRO ${e.javaClass.simpleName}: ${e.message}"
@@ -186,21 +231,27 @@ class AudioRouter(context: Context) {
         return out
     }
 
-    fun disable(): List<String> {
+    fun disable(headset: AudioDeviceInfo? = externalHeadset()): List<String> {
         val out = mutableListOf<String>()
         val svc = try {
             audioService()
         } catch (e: Throwable) {
             return listOf("ERRO ao obter IAudioService: ${e.javaClass.simpleName}: ${e.message}")
         }
+        val headsetAttr = headset?.let { runCatching { attributes(it.type, it.address) }.getOrNull() }
+        val hasDisabledClear = disabledMethods(svc, listOf("clear", "remove")).isNotEmpty()
         out += "DESATIVAR"
+        if (!hasDisabledClear) out += "INFO: sem método Disabled/NonDefault de limpeza no IAudioService"
         for ((preset, name) in PRESETS) {
             try {
-                out += step("$name($preset) clear PREFERRED") {
-                    call(svc, CLEAR, intArrayOf(preset, DEVICE_ROLE_PREFERRED), null)
+                out += step("$name($preset) clearPreferred") {
+                    call(svc, CLEAR_PREFERRED, intArrayOf(preset), null)
                 }
-                out += step("$name($preset) clear DISABLED") {
-                    call(svc, CLEAR, intArrayOf(preset, DEVICE_ROLE_DISABLED), null)
+                if (hasDisabledClear) {
+                    out += step("$name($preset) clearDisabled") { clearDisabled(svc, preset, headsetAttr) }
+                }
+                out += step("$name($preset) getPreferred") {
+                    call(svc, GET_PREFERRED, intArrayOf(preset), null)
                 }
             } catch (e: Throwable) {
                 out += "[$name($preset)] ERRO ${e.javaClass.simpleName}: ${e.message}"
