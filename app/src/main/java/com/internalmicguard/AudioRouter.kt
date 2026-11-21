@@ -39,7 +39,7 @@ class AudioRouter(context: Context) {
             AudioDeviceInfo.TYPE_TELEPHONY -> "TYPE_TELEPHONY"
             AudioDeviceInfo.TYPE_REMOTE_SUBMIX -> "TYPE_REMOTE_SUBMIX"
             AudioDeviceInfo.TYPE_FM_TUNER -> "TYPE_FM_TUNER"
-            AudioDeviceInfo.TYPE_ECHO_REFERENCE -> "TYPE_ECHO_REFERENCE"
+            28 -> "28"
             else -> "TYPE_$type"
         }
 
