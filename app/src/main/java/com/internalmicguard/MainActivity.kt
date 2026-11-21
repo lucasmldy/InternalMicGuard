@@ -17,6 +17,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -51,30 +52,22 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import org.lsposed.hiddenapibypass.HiddenApiBypass
 import rikka.shizuku.Shizuku
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.concurrent.thread
 
-enum class ShizukuState(val label: String) {
-    NOT_INSTALLED("Shizuku não instalado"),
-    STOPPED("Shizuku instalado, mas parado"),
-    PERMISSION_PENDING("Permissão do Shizuku pendente"),
-    GRANTED("Shizuku pronto (permissão concedida)")
-}
-
 class MainActivity : ComponentActivity() {
 
     companion object {
         private const val SHIZUKU_REQUEST = 1001
-        private const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
         private val GREEN = Color(0xFF2E7D32)
         private val RED = Color(0xFFC62828)
     }
 
     private lateinit var router: AudioRouter
+    private lateinit var prefs: GuardPrefs
     private val tester = MicTester()
     private lateinit var audioManager: AudioManager
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -86,6 +79,7 @@ class MainActivity : ComponentActivity() {
     private var blockHeadset by mutableStateOf(false)
     private var guardActive by mutableStateOf(false)
     private var busy by mutableStateOf(false)
+    private var diagnosticsExpanded by mutableStateOf(false)
     private var testSource by mutableIntStateOf(MediaRecorder.AudioSource.MIC)
     private var testing by mutableStateOf(false)
     private var levelDb by mutableStateOf(MicTester.MIN_DB)
@@ -122,15 +116,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        try {
-            HiddenApiBypass.addHiddenApiExemptions("")
-            log("HiddenApiBypass: isenções aplicadas")
-        } catch (e: Throwable) {
-            log("HiddenApiBypass ERRO: ${e.javaClass.simpleName}: ${e.message}")
-        }
-
         audioManager = getSystemService(AudioManager::class.java)
+        prefs = GuardPrefs(this)
         router = AudioRouter(this)
+        log(AudioRouter.hiddenApiStatus)
+        blockHeadset = prefs.blockHeadset
+        guardActive = prefs.guardActive
         refreshDevices()
         audioManager.registerAudioDeviceCallback(deviceCallback, mainHandler)
 
@@ -151,6 +142,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        guardActive = prefs.guardActive
+        blockHeadset = prefs.blockHeadset
+        refreshDevices()
         updateShizukuState()
     }
 
@@ -172,26 +166,25 @@ class MainActivity : ComponentActivity() {
         builtinMics = router.builtinMics()
         headset = router.externalHeadset()
         if (builtinMics.none { it.id == selectedMicId }) {
-            selectedMicId = builtinMics.firstOrNull()?.id ?: -1
+            selectedMicId = router.resolveMic(prefs.micAddress)?.id ?: -1
         }
     }
 
-    private fun isShizukuInstalled(): Boolean =
-        try {
-            packageManager.getPackageInfo(SHIZUKU_PACKAGE, 0)
-            true
-        } catch (e: PackageManager.NameNotFoundException) {
-            false
-        }
+    private fun selectMic(mic: AudioDeviceInfo) {
+        selectedMicId = mic.id
+        prefs.micAddress = mic.address
+        if (guardActive) activateGuard()
+    }
+
+    private fun setBlockHeadset(value: Boolean) {
+        blockHeadset = value
+        prefs.blockHeadset = value
+        if (guardActive) activateGuard()
+    }
 
     private fun updateShizukuState() {
         val previous = shizukuState
-        shizukuState = when {
-            !Shizuku.pingBinder() -> if (isShizukuInstalled()) ShizukuState.STOPPED else ShizukuState.NOT_INSTALLED
-            Shizuku.isPreV11() -> ShizukuState.STOPPED
-            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> ShizukuState.GRANTED
-            else -> ShizukuState.PERMISSION_PENDING
-        }
+        shizukuState = shizukuState(this)
         if (previous != shizukuState) log("Shizuku: ${shizukuState.label}")
         if (shizukuState == ShizukuState.GRANTED && router.signatures.isEmpty()) {
             try {
@@ -209,6 +202,7 @@ class MainActivity : ComponentActivity() {
         }
         if (Shizuku.shouldShowRequestPermissionRationale()) {
             log("Shizuku: permissão negada permanentemente; libere no app Shizuku")
+            Toast.makeText(this, "Libere a permissão no app Shizuku", Toast.LENGTH_SHORT).show()
         } else {
             Shizuku.requestPermission(SHIZUKU_REQUEST)
         }
@@ -219,15 +213,19 @@ class MainActivity : ComponentActivity() {
             log("Nenhum TYPE_BUILTIN_MIC selecionado")
             return
         }
+        prefs.micAddress = mic.address
         val hs = headset
         val block = blockHeadset
         busy = true
         thread(name = "RouterEnable") {
             val result = router.enable(mic, hs, block)
+            val ok = AudioRouter.enableSucceeded(result)
             mainHandler.post {
                 result.forEach { log(it) }
-                guardActive = true
+                guardActive = ok
+                prefs.guardActive = ok
                 busy = false
+                if (!ok) Toast.makeText(this, "Falha ao aplicar roteamento (veja Diagnóstico)", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -239,6 +237,7 @@ class MainActivity : ComponentActivity() {
             mainHandler.post {
                 result.forEach { log(it) }
                 guardActive = false
+                prefs.guardActive = false
                 busy = false
             }
         }
@@ -284,11 +283,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildReport(): String = buildString {
-        appendLine("=== InternalMicGuard ===")
+        appendLine("=== InternalMicGuard ${BuildConfigInfo.versionName(this@MainActivity)} ===")
         appendLine("Dispositivo: ${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})")
         appendLine("Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) build=${Build.DISPLAY}")
         appendLine("Shizuku: ${shizukuState.label}")
-        appendLine("Guard ativo: $guardActive | Bloquear P2: $blockHeadset")
+        appendLine("Guard ativo: $guardActive | Bloquear P2: $blockHeadset | mic salvo: '${prefs.micAddress}'")
         appendLine()
         appendLine("--- AudioDeviceInfo (entradas) ---")
         router.inputs().forEach { appendLine(AudioRouter.describe(it)) }
@@ -323,146 +322,87 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("InternalMicGuard", style = MaterialTheme.typography.headlineSmall)
-            ShizukuCard()
-            DevicesCard()
-            GuardCard()
-            TestCard()
-            LogCard()
+            MainCard()
+            DiagnosticsCard()
         }
     }
 
     @Composable
-    private fun ShizukuCard() {
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Shizuku", fontWeight = FontWeight.Bold)
-                Text(
-                    shizukuState.label,
-                    color = if (shizukuState == ShizukuState.GRANTED) GREEN else RED
-                )
-                when (shizukuState) {
-                    ShizukuState.NOT_INSTALLED -> Text("Instale o Shizuku e inicie-o via depuração sem fio.")
-                    ShizukuState.STOPPED -> OutlinedButton(onClick = { updateShizukuState() }) {
-                        Text("Verificar novamente")
-                    }
-                    ShizukuState.PERMISSION_PENDING -> Button(onClick = { requestShizukuPermission() }) {
-                        Text("Conceder permissão")
-                    }
-                    ShizukuState.GRANTED -> Unit
-                }
-            }
-        }
-    }
-
-    @Composable
-    private fun DevicesCard() {
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Microfone interno (TYPE_BUILTIN_MIC)", fontWeight = FontWeight.Bold)
-                if (builtinMics.isEmpty()) Text("Nenhum mic interno encontrado", color = RED)
-                builtinMics.forEach { mic ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(
-                            selected = mic.id == selectedMicId,
-                            onClick = { selectedMicId = mic.id }
-                        )
-                        Text(
-                            "#${mic.id} ${mic.productName} address='${mic.address}'",
-                            fontSize = 13.sp
-                        )
-                    }
-                }
-                HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                Text("Headset externo", fontWeight = FontWeight.Bold)
-                val hs = headset
-                Text(
-                    hs?.let { "${AudioRouter.typeName(it.type)} #${it.id} ${it.productName} address='${it.address}'" }
-                        ?: "Nenhum TYPE_WIRED_HEADSET / TYPE_USB_HEADSET conectado",
-                    fontSize = 13.sp
-                )
-            }
-        }
-    }
-
-    @Composable
-    private fun GuardCard() {
+    private fun MainCard() {
         val ready = shizukuState == ShizukuState.GRANTED && !busy
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Roteamento", fontWeight = FontWeight.Bold)
-                Text(
-                    if (guardActive) "Mic interno forçado" else "Inativo",
-                    color = if (guardActive) GREEN else Color.Unspecified
-                )
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(checked = blockHeadset, onCheckedChange = { blockHeadset = it })
-                    Text("  Bloquear mic do P2")
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = { activateGuard() },
-                        enabled = ready && selectedMicId != -1
-                    ) { Text("Ativar") }
-                    OutlinedButton(onClick = { deactivateGuard() }, enabled = ready) {
-                        Text("Desativar")
+                    Text(
+                        shizukuState.label,
+                        color = if (shizukuState == ShizukuState.GRANTED) GREEN else RED,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    when (shizukuState) {
+                        ShizukuState.PERMISSION_PENDING -> Button(onClick = { requestShizukuPermission() }) {
+                            Text("Permitir")
+                        }
+                        ShizukuState.STOPPED -> OutlinedButton(onClick = { updateShizukuState() }) {
+                            Text("Verificar")
+                        }
+                        else -> Unit
                     }
                 }
-            }
-        }
-    }
+                if (shizukuState == ShizukuState.NOT_INSTALLED) {
+                    Text("Instale o Shizuku e inicie-o via Depuração sem fio.", fontSize = 13.sp)
+                }
 
-    @Composable
-    private fun TestCard() {
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Teste ao vivo", fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(
-                        MediaRecorder.AudioSource.MIC to "MIC",
-                        MediaRecorder.AudioSource.VOICE_COMMUNICATION to "VOICE_COMMUNICATION"
-                    ).forEach { (source, label) ->
-                        FilterChip(
-                            selected = testSource == source,
-                            onClick = { if (!testing) testSource = source },
-                            enabled = !testing,
-                            label = { Text(label) }
+                val hs = headset
+                Text(
+                    if (hs != null) "Fone P2: conectado (${hs.productName})" else "Fone P2: não conectado",
+                    color = if (hs != null) Color.Unspecified else Color.Gray
+                )
+
+                HorizontalDivider()
+                Text("Microfone interno", fontWeight = FontWeight.Bold)
+                if (builtinMics.isEmpty()) Text("Nenhum mic interno encontrado", color = RED)
+                builtinMics.forEach { mic ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = !busy) { selectMic(mic) }
+                    ) {
+                        RadioButton(
+                            selected = mic.id == selectedMicId,
+                            onClick = { selectMic(mic) },
+                            enabled = !busy
+                        )
+                        Text(
+                            if (mic.address.isBlank()) "#${mic.id} ${mic.productName}" else mic.address,
+                            fontSize = 14.sp
                         )
                     }
                 }
-                Button(onClick = { toggleTest() }) {
-                    Text(if (testing) "Parar Teste" else "Iniciar Teste")
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Bloquear mic do P2", modifier = Modifier.weight(1f))
+                    Switch(checked = blockHeadset, onCheckedChange = { setBlockHeadset(it) }, enabled = !busy)
                 }
-                val fraction = ((levelDb - MicTester.MIN_DB) / -MicTester.MIN_DB).coerceIn(0f, 1f)
-                LinearProgressIndicator(
-                    progress = { fraction },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(14.dp),
-                    color = when {
-                        levelDb > -6f -> RED
-                        levelDb > -20f -> Color(0xFFF9A825)
-                        else -> GREEN
+
+                HorizontalDivider()
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Forçar mic interno", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        Text(
+                            when {
+                                busy -> "Aplicando..."
+                                guardActive -> "Ativo"
+                                else -> "Inativo"
+                            },
+                            color = if (guardActive) GREEN else Color.Gray
+                        )
                     }
-                )
-                Text(String.format(Locale.US, "%.1f dBFS", levelDb), fontFamily = FontFamily.Monospace)
-                val dev = routedDevice
-                val color = when (dev?.type) {
-                    AudioDeviceInfo.TYPE_BUILTIN_MIC -> GREEN
-                    AudioDeviceInfo.TYPE_WIRED_HEADSET -> RED
-                    else -> Color.Unspecified
-                }
-                Text("routedDevice", fontWeight = FontWeight.Bold)
-                if (dev == null) {
-                    Text(if (testing) "aguardando..." else "-", fontFamily = FontFamily.Monospace)
-                } else {
-                    Text(
-                        "type: ${AudioRouter.typeName(dev.type)} (${dev.type})\n" +
-                            "productName: ${dev.productName}\n" +
-                            "address: '${dev.address}'\n" +
-                            "id: ${dev.id}",
-                        color = color,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
+                    Switch(
+                        checked = guardActive,
+                        onCheckedChange = { if (it) activateGuard() else deactivateGuard() },
+                        enabled = ready && selectedMicId != -1
                     )
                 }
             }
@@ -470,22 +410,103 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun LogCard() {
+    private fun DiagnosticsCard() {
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Log", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    OutlinedButton(onClick = { logLines.clear() }) { Text("Limpar") }
-                    Text(" ")
-                    Button(onClick = { copyLogs() }) { Text("Copiar Logs") }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { diagnosticsExpanded = !diagnosticsExpanded }
+                ) {
+                    Text("Diagnóstico", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text(if (diagnosticsExpanded) "▲" else "▼")
                 }
-                Text(
-                    logLines.takeLast(60).joinToString("\n"),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    lineHeight = 14.sp
-                )
+                if (diagnosticsExpanded) {
+                    TestSection()
+                    HorizontalDivider()
+                    LogSection()
+                }
             }
         }
     }
+
+    @Composable
+    private fun TestSection() {
+        Text("Teste de captação ao vivo", fontWeight = FontWeight.Bold)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                MediaRecorder.AudioSource.MIC to "MIC",
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION to "VOICE_COMM"
+            ).forEach { (source, label) ->
+                FilterChip(
+                    selected = testSource == source,
+                    onClick = { if (!testing) testSource = source },
+                    enabled = !testing,
+                    label = { Text(label) }
+                )
+            }
+        }
+        Button(onClick = { toggleTest() }) {
+            Text(if (testing) "Parar Teste" else "Iniciar Teste")
+        }
+        val fraction = ((levelDb - MicTester.MIN_DB) / -MicTester.MIN_DB).coerceIn(0f, 1f)
+        LinearProgressIndicator(
+            progress = { fraction },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(14.dp),
+            color = when {
+                levelDb > -6f -> RED
+                levelDb > -20f -> Color(0xFFF9A825)
+                else -> GREEN
+            }
+        )
+        Text(String.format(Locale.US, "%.1f dBFS", levelDb), fontFamily = FontFamily.Monospace)
+        val dev = routedDevice
+        val color = when (dev?.type) {
+            AudioDeviceInfo.TYPE_BUILTIN_MIC -> GREEN
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> RED
+            else -> Color.Unspecified
+        }
+        Text("routedDevice", fontWeight = FontWeight.Bold)
+        if (dev == null) {
+            Text(if (testing) "aguardando..." else "-", fontFamily = FontFamily.Monospace)
+        } else {
+            Text(
+                "type: ${AudioRouter.typeName(dev.type)} (${dev.type})\n" +
+                    "productName: ${dev.productName}\n" +
+                    "address: '${dev.address}'\n" +
+                    "id: ${dev.id}",
+                color = color,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+    }
+
+    @Composable
+    private fun LogSection() {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Log", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            OutlinedButton(onClick = { logLines.clear() }) { Text("Limpar") }
+            Text(" ")
+            Button(onClick = { copyLogs() }) { Text("Copiar Logs") }
+        }
+        Text(
+            logLines.takeLast(60).joinToString("\n"),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+            lineHeight = 14.sp
+        )
+    }
+}
+
+private object BuildConfigInfo {
+    fun versionName(activity: ComponentActivity): String =
+        try {
+            activity.packageManager.getPackageInfo(activity.packageName, 0).versionName ?: "?"
+        } catch (e: Exception) {
+            "?"
+        }
 }

@@ -5,14 +5,80 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaRecorder
 import android.os.IBinder
+import android.content.pm.PackageManager
+import org.lsposed.hiddenapibypass.HiddenApiBypass
+import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
 import rikka.shizuku.SystemServiceHelper
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 
+enum class ShizukuState(val label: String) {
+    NOT_INSTALLED("Shizuku não instalado"),
+    STOPPED("Shizuku parado"),
+    PERMISSION_PENDING("Permissão do Shizuku pendente"),
+    GRANTED("Shizuku pronto")
+}
+
+private const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
+
+fun shizukuState(context: Context): ShizukuState {
+    val alive = try {
+        Shizuku.pingBinder()
+    } catch (e: Throwable) {
+        false
+    }
+    if (!alive) {
+        val installed = try {
+            context.packageManager.getPackageInfo(SHIZUKU_PACKAGE, 0)
+            true
+        } catch (e: PackageManager.NameNotFoundException) {
+            false
+        }
+        return if (installed) ShizukuState.STOPPED else ShizukuState.NOT_INSTALLED
+    }
+    return try {
+        when {
+            Shizuku.isPreV11() -> ShizukuState.STOPPED
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> ShizukuState.GRANTED
+            else -> ShizukuState.PERMISSION_PENDING
+        }
+    } catch (e: Throwable) {
+        ShizukuState.STOPPED
+    }
+}
+
+class GuardPrefs(context: Context) {
+    private val sp = context.applicationContext.getSharedPreferences("internal_mic_guard", Context.MODE_PRIVATE)
+
+    var micAddress: String?
+        get() = sp.getString("mic_address", null)
+        set(value) = sp.edit().putString("mic_address", value).apply()
+
+    var guardActive: Boolean
+        get() = sp.getBoolean("guard_active", false)
+        set(value) = sp.edit().putBoolean("guard_active", value).apply()
+
+    var blockHeadset: Boolean
+        get() = sp.getBoolean("block_headset", false)
+        set(value) = sp.edit().putBoolean("block_headset", value).apply()
+}
+
 class AudioRouter(context: Context) {
 
     companion object {
+        val hiddenApiStatus: String by lazy {
+            try {
+                HiddenApiBypass.addHiddenApiExemptions("")
+                "HiddenApiBypass: isenções aplicadas"
+            } catch (e: Throwable) {
+                "HiddenApiBypass ERRO: ${e.javaClass.simpleName}: ${e.message}"
+            }
+        }
+
+        fun enableSucceeded(lines: List<String>): Boolean =
+            lines.any { it.contains("setPreferred] SUCCESS") }
+
         const val ROLE_INPUT = 1
         const val DEVICE_ROLE_PREFERRED = 1
         const val DEVICE_ROLE_DISABLED = 2
@@ -41,7 +107,7 @@ class AudioRouter(context: Context) {
             AudioDeviceInfo.TYPE_TELEPHONY -> "TYPE_TELEPHONY"
             AudioDeviceInfo.TYPE_REMOTE_SUBMIX -> "TYPE_REMOTE_SUBMIX"
             AudioDeviceInfo.TYPE_FM_TUNER -> "TYPE_FM_TUNER"
-            28 -> "28"
+            28 -> "TYPE_ECHO_REFERENCE"
             else -> "TYPE_$type"
         }
 
@@ -50,6 +116,10 @@ class AudioRouter(context: Context) {
     }
 
     private val audioManager = context.getSystemService(AudioManager::class.java)
+
+    init {
+        hiddenApiStatus
+    }
 
     var signatures: List<String> = emptyList()
         private set
@@ -63,6 +133,11 @@ class AudioRouter(context: Context) {
     fun externalHeadset(): AudioDeviceInfo? =
         inputs().firstOrNull { it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET }
             ?: inputs().firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
+
+    fun resolveMic(address: String?): AudioDeviceInfo? {
+        val mics = builtinMics()
+        return mics.firstOrNull { address != null && it.address == address } ?: mics.firstOrNull()
+    }
 
     private fun audioService(): Any {
         val binder = SystemServiceHelper.getSystemService(Context.AUDIO_SERVICE)
