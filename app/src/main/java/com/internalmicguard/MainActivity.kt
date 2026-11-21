@@ -176,7 +176,7 @@ class MainActivity : ComponentActivity() {
         if (guardActive) activateGuard()
     }
 
-    private fun setBlockHeadset(value: Boolean) {
+    private fun updateBlockHeadset(value: Boolean) {
         blockHeadset = value
         prefs.blockHeadset = value
         if (guardActive) activateGuard()
@@ -383,7 +383,7 @@ class MainActivity : ComponentActivity() {
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Bloquear mic do P2", modifier = Modifier.weight(1f))
-                    Switch(checked = blockHeadset, onCheckedChange = { setBlockHeadset(it) }, enabled = !busy)
+                    Switch(checked = blockHeadset, onCheckedChange = { updateBlockHeadset(it) }, enabled = !busy)
                 }
 
                 HorizontalDivider()
